@@ -1,0 +1,22 @@
+services:
+  sub2api-account-guardian:
+    build:
+      context: .
+    image: sub2api-account-guardian:local
+    container_name: sub2api-account-guardian
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8788}:8788"
+    networks:
+      - sub2api-network
+
+networks:
+  sub2api-network:
+    external: true
+    name: ${SUB2API_DOCKER_NETWORK:-deploy_sub2api-network}

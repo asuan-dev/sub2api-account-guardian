@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+data/
+cache/
+guardian.exe
+*.log
+*.jsonl
