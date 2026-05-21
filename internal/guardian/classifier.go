@@ -16,10 +16,11 @@ const (
 type TestResult string
 
 const (
-	TestOK      TestResult = "ok"
-	TestDead    TestResult = "dead"
-	TestQuota   TestResult = "quota"
-	TestUnknown TestResult = "unknown"
+	TestOK           TestResult = "ok"
+	TestDead         TestResult = "dead"
+	TestQuota        TestResult = "quota"
+	TestNeedsRelogin TestResult = "needs_relogin"
+	TestUnknown      TestResult = "unknown"
 )
 
 var quotaMarkers = []string{
@@ -52,6 +53,7 @@ var needsReloginMarkers = []string{
 	"needs relogin",
 	"need relogin",
 	"重新登录",
+	"refresh_token_reused",
 }
 
 var infrastructureMarkers = []string{
@@ -99,7 +101,6 @@ var authMarkers = []string{
 	"invalid refresh",
 	"refresh token is invalid",
 	"refresh token expired",
-	"refresh_token_reused",
 	"token_expired",
 	"unauthorized (401)",
 }
@@ -141,7 +142,9 @@ func ClassifyTestError(errText string) TestResult {
 		return TestDead
 	case ClassQuota:
 		return TestQuota
-	case ClassInfrastructure, ClassRequestParameter, ClassNeedsRelogin, ClassNotEligible:
+	case ClassNeedsRelogin:
+		return TestNeedsRelogin
+	case ClassInfrastructure, ClassRequestParameter, ClassNotEligible:
 		return TestUnknown
 	default:
 		return TestUnknown
@@ -149,6 +152,32 @@ func ClassifyTestError(errText string) TestResult {
 }
 
 func IsEligibleAccount(platform, accountType, status string, deleted bool, errorText string) bool {
+	return isEligibleBaseAccount(platform, accountType, status, deleted, errorText) && ClassifyEvidence(errorText) == ClassEligibleAuth
+}
+
+func IsRefreshableMissingAccessTokenAccount(acc Account) bool {
+	if !isEligibleBaseAccount(acc.Platform, acc.Type, acc.Status, acc.Deleted, acc.ErrorMessage) {
+		return false
+	}
+	accessToken, _ := acc.Credentials["access_token"].(string)
+	refreshToken, _ := acc.Credentials["refresh_token"].(string)
+	return strings.TrimSpace(accessToken) == "" && strings.TrimSpace(refreshToken) != ""
+}
+
+func IsInactiveSchedulableAccount(acc Account) bool {
+	if acc.Deleted || !acc.Schedulable {
+		return false
+	}
+	if strings.ToLower(strings.TrimSpace(acc.Platform)) != "openai" {
+		return false
+	}
+	if strings.ToLower(strings.TrimSpace(acc.Type)) != "oauth" {
+		return false
+	}
+	return strings.ToLower(strings.TrimSpace(acc.Status)) == "inactive"
+}
+
+func isEligibleBaseAccount(platform, accountType, status string, deleted bool, errorText string) bool {
 	if deleted {
 		return false
 	}
@@ -165,10 +194,10 @@ func IsEligibleAccount(platform, accountType, status string, deleted bool, error
 		return false
 	}
 	normalizedStatus := strings.ToLower(strings.TrimSpace(status))
-	if normalizedStatus != "error" && normalizedStatus != "active" {
+	if normalizedStatus != "error" && normalizedStatus != "active" && normalizedStatus != "inactive" {
 		return false
 	}
-	return ClassifyEvidence(errorText) == ClassEligibleAuth
+	return true
 }
 
 func normalize(values ...string) string {

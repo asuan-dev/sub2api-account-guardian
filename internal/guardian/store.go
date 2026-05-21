@@ -41,19 +41,7 @@ func (s *Store) TryAdvisoryLock(ctx context.Context) (bool, error) {
 }
 
 func (s *Store) EligibleAccounts(ctx context.Context, limit int) ([]Account, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT id, name, platform, type, status, schedulable, deleted_at IS NOT NULL AS deleted,
-		       COALESCE(error_message, '') AS error_message,
-		       COALESCE(credentials, '{}'::jsonb) AS credentials,
-		       updated_at
-		FROM accounts
-		WHERE deleted_at IS NULL
-		  AND platform = 'openai'
-		  AND type = 'oauth'
-		  AND status IN ('error', 'active')
-		  AND COALESCE(error_message, '') <> ''
-		ORDER BY updated_at ASC
-		LIMIT $1`, limit)
+	rows, err := s.pool.Query(ctx, eligibleAccountsQuery(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -64,11 +52,29 @@ func (s *Store) EligibleAccounts(ctx context.Context, limit int) ([]Account, err
 		if err != nil {
 			return nil, err
 		}
-		if IsEligibleAccount(acc.Platform, acc.Type, acc.Status, acc.Deleted, acc.ErrorMessage) {
+		if IsEligibleAccount(acc.Platform, acc.Type, acc.Status, acc.Deleted, acc.ErrorMessage) || IsInactiveSchedulableAccount(acc) {
 			out = append(out, acc)
 		}
 	}
 	return out, rows.Err()
+}
+
+func eligibleAccountsQuery() string {
+	return `
+		SELECT id, name, platform, type, status, schedulable, deleted_at IS NOT NULL AS deleted,
+		       COALESCE(error_message, '') AS error_message,
+		       COALESCE(credentials, '{}'::jsonb) AS credentials,
+		       updated_at
+		FROM accounts
+		WHERE deleted_at IS NULL
+		  AND platform = 'openai'
+		  AND type = 'oauth'
+		  AND (
+		    (status IN ('error', 'active', 'inactive') AND COALESCE(error_message, '') <> '')
+		    OR (status = 'inactive' AND schedulable = true)
+		  )
+		ORDER BY updated_at ASC
+		LIMIT $1`
 }
 
 func (s *Store) AccountSummary(ctx context.Context) (map[string]int64, error) {
@@ -138,17 +144,7 @@ func (s *Store) DeletedReviveCandidates(ctx context.Context, limit int) ([]Accou
 		limitClause = " LIMIT $1"
 		args = append(args, limit)
 	}
-	rows, err := s.pool.Query(ctx, `
-		SELECT id, name, platform, type, status, schedulable, deleted_at IS NOT NULL AS deleted,
-		       COALESCE(error_message, '') AS error_message,
-		       COALESCE(credentials, '{}'::jsonb) AS credentials,
-		       updated_at
-		FROM accounts
-		WHERE deleted_at IS NOT NULL
-		  AND platform = 'openai'
-		  AND type = 'oauth'
-		  AND COALESCE(credentials, '{}'::jsonb) ? 'refresh_token'
-		ORDER BY deleted_at DESC`+limitClause, args...)
+	rows, err := s.pool.Query(ctx, deletedReviveCandidatesQuery(limitClause), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -162,6 +158,20 @@ func (s *Store) DeletedReviveCandidates(ctx context.Context, limit int) ([]Accou
 		out = append(out, acc)
 	}
 	return out, rows.Err()
+}
+
+func deletedReviveCandidatesQuery(limitClause string) string {
+	return `
+		SELECT id, name, platform, type, status, schedulable, deleted_at IS NOT NULL AS deleted,
+		       COALESCE(error_message, '') AS error_message,
+		       COALESCE(credentials, '{}'::jsonb) AS credentials,
+		       updated_at
+		FROM accounts
+		WHERE deleted_at IS NOT NULL
+		  AND platform = 'openai'
+		  AND type = 'oauth'
+		  AND COALESCE(credentials, '{}'::jsonb) ? 'refresh_token'
+		ORDER BY deleted_at DESC` + limitClause
 }
 
 func (s *Store) TemporarilyRestoreForTest(ctx context.Context, id int64) error {

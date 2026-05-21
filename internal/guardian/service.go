@@ -157,7 +157,8 @@ func (s *Service) ProcessAccount(ctx context.Context, acc Account) {
 		s.writeAudit(rec)
 		log.Printf("account=%d action=%s reason=%s", rec.AccountID, rec.FinalAction, rec.FinalReason)
 	}()
-	if rec.Classification != ClassEligibleAuth {
+	inactiveSchedulable := IsInactiveSchedulableAccount(acc)
+	if rec.Classification != ClassEligibleAuth && !inactiveSchedulable {
 		rec.FinalAction = "skipped_not_eligible"
 		rec.FinalReason = "not account-internal auth evidence"
 		log.Printf("account=%d phase=classify result=%s action=skip", acc.ID, rec.Classification)
@@ -186,7 +187,6 @@ func (s *Service) ProcessAccount(ctx context.Context, acc Account) {
 		tokens, reason, err := s.refresher.RefreshWithRetries(ctx, refreshToken)
 		rec.RefreshReason = reason
 		if err == nil {
-			rec.RefreshResult = "ok"
 			log.Printf("account=%d phase=refresh result=ok", acc.ID)
 			log.Printf("account=%d phase=credentials_patch start", acc.ID)
 			if err := s.store.PatchCredentials(ctx, acc.ID, tokens); err != nil {
@@ -197,6 +197,22 @@ func (s *Service) ProcessAccount(ctx context.Context, acc Account) {
 				return
 			}
 			log.Printf("account=%d phase=credentials_patch result=ok", acc.ID)
+			fresh, loadErr := waitForRefreshedAccount(ctx, s.store.GetAccount, acc.ID, s.cfg.RetryAttempts, s.cfg.RetryDelay)
+			if loadErr != nil {
+				rec.RefreshResult = "verify_failed"
+				rec.FinalAction = "kept_unknown"
+				rec.FinalReason = "load account after refresh failed: " + loadErr.Error()
+				log.Printf("account=%d phase=refresh_verify result=failed reason=%s", acc.ID, loadErr.Error())
+				return
+			}
+			if IsRefreshableMissingAccessTokenAccount(fresh) {
+				rec.RefreshResult = "verify_failed"
+				rec.FinalAction = "kept_unknown"
+				rec.FinalReason = "access_token still missing after refresh"
+				log.Printf("account=%d phase=refresh_verify result=failed reason=access_token still missing after refresh", acc.ID)
+				return
+			}
+			rec.RefreshResult = "ok"
 		} else {
 			rec.RefreshResult = "failed"
 			log.Printf("account=%d phase=refresh result=failed reason=%s", acc.ID, reason)
@@ -222,6 +238,11 @@ func (s *Service) ProcessAccount(ctx context.Context, acc Account) {
 	} else {
 		rec.RefreshResult = "missing_refresh_token"
 		log.Printf("account=%d phase=refresh result=missing_refresh_token", acc.ID)
+		if inactiveSchedulable && acc.ErrorMessage == "" {
+			rec.FinalAction = "disabled_inactive"
+			rec.FinalReason = "inactive account scheduling disabled; no refresh token available"
+			return
+		}
 	}
 
 	log.Printf("account=%d phase=test start model=%s", acc.ID, s.cfg.TestModel)
@@ -229,44 +250,107 @@ func (s *Service) ProcessAccount(ctx context.Context, acc Account) {
 	rec.TestResult = testResult
 	rec.TestReason = testReason
 	log.Printf("account=%d phase=test result=%s reason=%s", acc.ID, testResult, testReason)
-	switch testResult {
-	case TestOK:
-		rec.FinalAction = "revived"
-		rec.FinalReason = "live check succeeded"
+	finalAction, finalReason := resolveTestFinalAction(testResult, testReason)
+	rec.FinalAction = finalAction
+	rec.FinalReason = finalReason
+	switch finalAction {
+	case "revived":
 		log.Printf("account=%d phase=mark_live start", acc.ID)
 		if err := s.store.MarkLive(ctx, acc.ID); err != nil {
 			rec.FinalAction = "kept_unknown"
 			rec.FinalReason = "mark live failed: " + err.Error()
 			log.Printf("account=%d phase=mark_live result=failed reason=%s", acc.ID, err.Error())
 		} else {
+			rec.FinalAction = "revived"
+			rec.FinalReason = "live check succeeded"
 			log.Printf("account=%d phase=mark_live result=ok", acc.ID)
 		}
-	case TestQuota:
-		rec.FinalAction = "kept_quota"
-		rec.FinalReason = "quota/rate-limit belongs to Sub2API handling"
+	case "kept_quota":
 		log.Printf("account=%d phase=keep_quota start", acc.ID)
 		if err := s.store.KeepQuota(ctx, acc.ID); err != nil {
 			rec.FinalAction = "kept_unknown"
 			rec.FinalReason = "mark quota keep failed: " + err.Error()
 			log.Printf("account=%d phase=keep_quota result=failed reason=%s", acc.ID, err.Error())
 		} else {
+			rec.FinalAction = "kept_quota"
+			rec.FinalReason = "quota/rate-limit belongs to Sub2API handling"
 			log.Printf("account=%d phase=keep_quota result=ok", acc.ID)
 		}
-	case TestDead:
-		rec.FinalAction = "soft_deleted"
-		rec.FinalReason = "deterministic auth death after revive/test"
+	case "soft_deleted":
 		log.Printf("account=%d phase=soft_delete start", acc.ID)
-		if err := s.store.SoftDelete(ctx, acc.ID, rec.FinalReason+": "+testReason); err != nil {
+		if err := s.store.SoftDelete(ctx, acc.ID, "deterministic auth death after revive/test: "+testReason); err != nil {
 			rec.FinalAction = "kept_unknown"
 			rec.FinalReason = "soft delete failed: " + err.Error()
 			log.Printf("account=%d phase=soft_delete result=failed reason=%s", acc.ID, err.Error())
 		} else {
+			rec.FinalAction = "soft_deleted"
+			rec.FinalReason = "deterministic auth death after revive/test"
 			log.Printf("account=%d phase=soft_delete result=ok", acc.ID)
+		}
+	case "needs_relogin":
+		log.Printf("account=%d phase=needs_relogin start", acc.ID)
+		if err := s.store.MarkNeedsRelogin(ctx, acc.ID, "needs manual relogin: "+testReason); err != nil {
+			rec.FinalAction = "kept_unknown"
+			rec.FinalReason = "mark needs relogin failed: " + err.Error()
+			log.Printf("account=%d phase=needs_relogin result=failed reason=%s", acc.ID, err.Error())
+		} else {
+			rec.FinalAction = "needs_relogin"
+			rec.FinalReason = "needs manual relogin: " + testReason
+			log.Printf("account=%d phase=needs_relogin result=ok", acc.ID)
 		}
 	default:
 		rec.FinalAction = "kept_unknown"
 		rec.FinalReason = "test uncertain: " + testReason
 	}
+}
+
+func resolveTestFinalAction(result TestResult, reason string) (string, string) {
+	switch result {
+	case TestOK:
+		return "revived", "live check succeeded"
+	case TestQuota:
+		return "kept_quota", "quota/rate-limit belongs to Sub2API handling"
+	case TestDead:
+		return "soft_deleted", "deterministic auth death after revive/test"
+	case TestNeedsRelogin:
+		return "needs_relogin", "needs manual relogin: " + reason
+	default:
+		if ClassifyEvidence(reason) == ClassNeedsRelogin {
+			return "needs_relogin", "needs manual relogin: " + reason
+		}
+		return "kept_unknown", "test uncertain: " + reason
+	}
+}
+
+func waitForRefreshedAccount(
+	ctx context.Context,
+	load func(context.Context, int64) (Account, error),
+	id int64,
+	attempts int,
+	delay time.Duration,
+) (Account, error) {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var last Account
+	for attempt := 1; attempt <= attempts; attempt++ {
+		acc, err := load(ctx, id)
+		if err != nil {
+			return Account{}, err
+		}
+		last = acc
+		if !IsRefreshableMissingAccessTokenAccount(acc) {
+			return acc, nil
+		}
+		if attempt < attempts {
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return Account{}, ctx.Err()
+			}
+		}
+	}
+	return last, fmt.Errorf("access_token still missing after refresh")
 }
 
 func (s *Service) CheckDeletedReviveCandidates(ctx context.Context, limit int) []AuditRecord {

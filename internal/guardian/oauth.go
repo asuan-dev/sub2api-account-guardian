@@ -88,7 +88,8 @@ func (r *OAuthRefresher) Refresh(ctx context.Context, refreshToken string) (OAut
 
 func isTransientRefreshFailure(reason string) bool {
 	text := strings.ToLower(reason)
-	if ClassifyEvidence(text) == ClassEligibleAuth {
+	classification := ClassifyEvidence(text)
+	if classification == ClassEligibleAuth || classification == ClassNeedsRelogin {
 		return false
 	}
 	return containsAny(text, infrastructureMarkers)

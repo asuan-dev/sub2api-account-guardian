@@ -41,6 +41,59 @@ func (c *Sub2APIClient) TestAccountWithRetries(ctx context.Context, accountID in
 	return lastResult, lastReason
 }
 
+func (c *Sub2APIClient) RefreshAccountWithRetries(ctx context.Context, accountID int64) (string, error) {
+	var lastReason = "not attempted"
+	for attempt := 1; attempt <= c.cfg.RetryAttempts; attempt++ {
+		reason, err := c.RefreshAccount(ctx, accountID)
+		if err == nil {
+			return fmt.Sprintf("%s after %d attempt(s)", reason, attempt), nil
+		}
+		lastReason = reason
+		if !isTransientRefreshFailure(reason) {
+			return reason, err
+		}
+		if attempt < c.cfg.RetryAttempts {
+			select {
+			case <-time.After(c.cfg.RetryDelay):
+			case <-ctx.Done():
+				return ctx.Err().Error(), ctx.Err()
+			}
+		}
+	}
+	return lastReason, fmt.Errorf(lastReason)
+}
+
+func (c *Sub2APIClient) RefreshAccount(ctx context.Context, accountID int64) (string, error) {
+	urls := []string{
+		fmt.Sprintf("%s/api/v1/admin/openai/accounts/%d/refresh", c.cfg.Sub2APIURL, accountID),
+		fmt.Sprintf("%s/api/v1/admin/accounts/%d/refresh", c.cfg.Sub2APIURL, accountID),
+	}
+	var lastReason string
+	for _, url := range urls {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+		if err != nil {
+			return err.Error(), err
+		}
+		req.Header.Set("x-api-key", c.cfg.Sub2APIKey)
+		req.Header.Set("Accept", "application/json")
+		resp, err := c.client.Do(req)
+		if err != nil {
+			return err.Error(), err
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		text := strings.TrimSpace(string(body))
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return fmt.Sprintf("Sub2API refresh HTTP %d: %s", resp.StatusCode, text), nil
+		}
+		lastReason = fmt.Sprintf("Sub2API refresh HTTP %d: %s", resp.StatusCode, text)
+		if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusMethodNotAllowed {
+			return lastReason, fmt.Errorf(lastReason)
+		}
+	}
+	return lastReason, fmt.Errorf(lastReason)
+}
+
 func (c *Sub2APIClient) TestAccount(ctx context.Context, accountID int64) (TestResult, string) {
 	payload := map[string]string{"model_id": c.cfg.TestModel}
 	body, _ := json.Marshal(payload)
