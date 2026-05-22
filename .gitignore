@@ -6,3 +6,4 @@ cache/
 guardian.exe
 *.log
 *.jsonl
+.serena/

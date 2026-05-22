@@ -6,16 +6,18 @@ import (
 )
 
 type Account struct {
-	ID           int64
-	Name         string
-	Platform     string
-	Type         string
-	Status       string
-	Schedulable  bool
-	Deleted      bool
-	ErrorMessage string
-	Credentials  map[string]any
-	UpdatedAt    time.Time
+	ID                      int64
+	Name                    string
+	Platform                string
+	Type                    string
+	Status                  string
+	Schedulable             bool
+	Deleted                 bool
+	ErrorMessage            string
+	Credentials             map[string]any
+	UpdatedAt               time.Time
+	TempUnschedulableUntil  *time.Time
+	TempUnschedulableReason string
 }
 
 type AuditRecord struct {

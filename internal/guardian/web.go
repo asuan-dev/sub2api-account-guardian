@@ -299,6 +299,12 @@ func actionCN(action string) string {
 		return "结果不确定，未删除"
 	case "soft_deleted":
 		return "确认死亡，已软删除"
+	case "environment_hold":
+		return "网络/节点问题，已挂起等待重测"
+	case "deleted_kept_environment":
+		return "软删除账号是网络/节点证据，跳过刷新"
+	case "disabled_inactive":
+		return "未启用账号，已关闭调度"
 	case "skipped_infrastructure_failure":
 		return "网络问题，跳过"
 	case "skipped_not_eligible":

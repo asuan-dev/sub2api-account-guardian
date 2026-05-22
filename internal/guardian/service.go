@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -141,8 +142,8 @@ func (s *Service) Enqueue(ctx context.Context, id int64) {
 			log.Printf("load account %d failed: %v", id, err)
 			return
 		}
-		if !IsEligibleAccount(acc.Platform, acc.Type, acc.Status, acc.Deleted, acc.ErrorMessage) {
-			s.writeAudit(AuditRecord{AccountID: id, AccountName: acc.Name, InitialStatus: acc.Status, InitialErrorMessage: acc.ErrorMessage, Classification: ClassifyEvidence(acc.ErrorMessage), FinalAction: "skipped_not_eligible", FinalReason: "account is not an eligible account-internal failure", StartedAt: time.Now(), FinishedAt: time.Now(), DryRun: s.cfg.DryRun})
+		if !IsGuardianCandidateAccount(acc, time.Now()) {
+			s.writeAudit(AuditRecord{AccountID: id, AccountName: acc.Name, InitialStatus: acc.Status, InitialErrorMessage: acc.ErrorMessage, Classification: ClassifyEvidence(acc.ErrorMessage, acc.TempUnschedulableReason), FinalAction: "skipped_not_eligible", FinalReason: "account is not a guardian candidate", StartedAt: time.Now(), FinishedAt: time.Now(), DryRun: s.cfg.DryRun})
 			return
 		}
 		s.ProcessAccount(ctx, acc)
@@ -151,16 +152,16 @@ func (s *Service) Enqueue(ctx context.Context, id int64) {
 
 func (s *Service) ProcessAccount(ctx context.Context, acc Account) {
 	started := time.Now()
-	rec := AuditRecord{AccountID: acc.ID, AccountName: acc.Name, InitialStatus: acc.Status, InitialErrorMessage: acc.ErrorMessage, Classification: ClassifyEvidence(acc.ErrorMessage), StartedAt: started, DryRun: s.cfg.DryRun}
+	rec := AuditRecord{AccountID: acc.ID, AccountName: acc.Name, InitialStatus: acc.Status, InitialErrorMessage: acc.ErrorMessage, Classification: ClassifyEvidence(acc.ErrorMessage, acc.TempUnschedulableReason), StartedAt: started, DryRun: s.cfg.DryRun}
 	defer func() {
 		rec.FinishedAt = time.Now()
 		s.writeAudit(rec)
 		log.Printf("account=%d action=%s reason=%s", rec.AccountID, rec.FinalAction, rec.FinalReason)
 	}()
 	inactiveSchedulable := IsInactiveSchedulableAccount(acc)
-	if rec.Classification != ClassEligibleAuth && !inactiveSchedulable {
+	if !IsGuardianCandidateAccount(acc, time.Now()) {
 		rec.FinalAction = "skipped_not_eligible"
-		rec.FinalReason = "not account-internal auth evidence"
+		rec.FinalReason = "not account-internal candidate"
 		log.Printf("account=%d phase=classify result=%s action=skip", acc.ID, rec.Classification)
 		return
 	}
@@ -169,6 +170,28 @@ func (s *Service) ProcessAccount(ctx context.Context, acc Account) {
 		rec.FinalAction = "would_process"
 		rec.FinalReason = "dry-run: would disable scheduling, attempt revive, verify with Sub2API test, then restore/quota-keep/soft-delete based on result"
 		log.Printf("account=%d phase=dry_run result=would_process", acc.ID)
+		return
+	}
+	if IsEnvironmentHoldCandidate(acc, time.Now()) {
+		s.processByLiveTestOnly(ctx, acc, &rec)
+		return
+	}
+	if IsDisabledWithoutEvidence(acc) {
+		s.processByLiveTestOnly(ctx, acc, &rec)
+		return
+	}
+	if rec.Classification == ClassInfrastructure {
+		rec.FinalAction = "environment_hold"
+		rec.FinalReason = "guardian env hold: " + firstNonEmpty(acc.ErrorMessage, acc.TempUnschedulableReason)
+		log.Printf("account=%d phase=environment_hold start reason=%s", acc.ID, rec.FinalReason)
+		if err := s.store.MarkEnvironmentHold(ctx, acc.ID, rec.FinalReason, s.cfg.Interval*10); err != nil {
+			rec.FinalAction = "kept_unknown"
+			rec.FinalReason = "mark environment hold failed: " + err.Error()
+			log.Printf("account=%d phase=environment_hold result=failed reason=%s", acc.ID, err.Error())
+		} else {
+			rec.SchedulingDisabled = true
+			log.Printf("account=%d phase=environment_hold result=ok", acc.ID)
+		}
 		return
 	}
 	log.Printf("account=%d phase=disable_scheduling start", acc.ID)
@@ -217,21 +240,33 @@ func (s *Service) ProcessAccount(ctx context.Context, acc Account) {
 			rec.RefreshResult = "failed"
 			log.Printf("account=%d phase=refresh result=failed reason=%s", acc.ID, reason)
 			if ClassifyEvidence(reason) == ClassNeedsRelogin {
-				rec.FinalAction = "needs_relogin"
+				rec.FinalAction = "soft_deleted"
 				rec.FinalReason = "needs manual relogin: " + reason
-				log.Printf("account=%d phase=needs_relogin start", acc.ID)
-				if err := s.store.MarkNeedsRelogin(ctx, acc.ID, rec.FinalReason); err != nil {
+				log.Printf("account=%d phase=needs_relogin_soft_delete start", acc.ID)
+				if err := s.store.SoftDelete(ctx, acc.ID, rec.FinalReason); err != nil {
 					rec.FinalAction = "kept_unknown"
-					rec.FinalReason = "mark needs relogin failed: " + err.Error()
-					log.Printf("account=%d phase=needs_relogin result=failed reason=%s", acc.ID, err.Error())
+					rec.FinalReason = "soft delete needs relogin failed: " + err.Error()
+					log.Printf("account=%d phase=needs_relogin_soft_delete result=failed reason=%s", acc.ID, err.Error())
 				} else {
-					log.Printf("account=%d phase=needs_relogin result=ok", acc.ID)
+					log.Printf("account=%d phase=needs_relogin_soft_delete result=ok", acc.ID)
 				}
 				return
 			}
-			if ClassifyEvidence(reason) != ClassEligibleAuth {
+			cls := ClassifyEvidence(reason)
+			if cls == ClassInfrastructure {
+				rec.FinalAction = "environment_hold"
+				rec.FinalReason = "guardian env hold: refresh uncertain: " + reason
+				if err := s.store.MarkEnvironmentHold(ctx, acc.ID, rec.FinalReason, s.cfg.Interval*10); err != nil {
+					rec.FinalAction = "kept_unknown"
+					rec.FinalReason = "mark environment hold failed: " + err.Error()
+					log.Printf("account=%d phase=refresh_environment_hold result=failed reason=%s", acc.ID, err.Error())
+				}
+				return
+			}
+			if cls != ClassEligibleAuth {
 				rec.FinalAction = "kept_unknown"
 				rec.FinalReason = "refresh uncertain: " + reason
+				s.markSkippedNonAccountIssue(ctx, acc.ID, &rec)
 				return
 			}
 		}
@@ -251,57 +286,155 @@ func (s *Service) ProcessAccount(ctx context.Context, acc Account) {
 	rec.TestReason = testReason
 	log.Printf("account=%d phase=test result=%s reason=%s", acc.ID, testResult, testReason)
 	finalAction, finalReason := resolveTestFinalAction(testResult, testReason)
+	s.applyTestFinalAction(ctx, acc, &rec, finalAction, finalReason, testReason, "test")
+}
+
+func (s *Service) processByLiveTestOnly(ctx context.Context, acc Account, rec *AuditRecord) {
+	log.Printf("account=%d phase=temp_live_test start model=%s", acc.ID, s.cfg.TestModel)
+	testResult, testReason := s.sub2api.TestAccountWithRetries(ctx, acc.ID)
+	rec.TestResult = testResult
+	rec.TestReason = testReason
+	log.Printf("account=%d phase=temp_live_test result=%s reason=%s", acc.ID, testResult, testReason)
+	finalAction, finalReason := resolveTestFinalAction(testResult, testReason)
+	if finalAction == "soft_deleted" {
+		s.reviveAfterAuthTest(ctx, acc, rec, finalReason+": "+testReason)
+		return
+	}
+	s.applyTestFinalAction(ctx, acc, rec, finalAction, finalReason, testReason, "temp_live_test")
+}
+
+func (s *Service) applyTestFinalAction(ctx context.Context, acc Account, rec *AuditRecord, finalAction, finalReason, testReason, phase string) {
 	rec.FinalAction = finalAction
 	rec.FinalReason = finalReason
 	switch finalAction {
 	case "revived":
-		log.Printf("account=%d phase=mark_live start", acc.ID)
+		log.Printf("account=%d phase=%s_mark_live start", acc.ID, phase)
 		if err := s.store.MarkLive(ctx, acc.ID); err != nil {
 			rec.FinalAction = "kept_unknown"
 			rec.FinalReason = "mark live failed: " + err.Error()
-			log.Printf("account=%d phase=mark_live result=failed reason=%s", acc.ID, err.Error())
+			log.Printf("account=%d phase=%s_mark_live result=failed reason=%s", acc.ID, phase, err.Error())
 		} else {
 			rec.FinalAction = "revived"
 			rec.FinalReason = "live check succeeded"
-			log.Printf("account=%d phase=mark_live result=ok", acc.ID)
+			log.Printf("account=%d phase=%s_mark_live result=ok", acc.ID, phase)
 		}
 	case "kept_quota":
-		log.Printf("account=%d phase=keep_quota start", acc.ID)
+		log.Printf("account=%d phase=%s_keep_quota start", acc.ID, phase)
 		if err := s.store.KeepQuota(ctx, acc.ID); err != nil {
 			rec.FinalAction = "kept_unknown"
 			rec.FinalReason = "mark quota keep failed: " + err.Error()
-			log.Printf("account=%d phase=keep_quota result=failed reason=%s", acc.ID, err.Error())
+			log.Printf("account=%d phase=%s_keep_quota result=failed reason=%s", acc.ID, phase, err.Error())
 		} else {
 			rec.FinalAction = "kept_quota"
 			rec.FinalReason = "quota/rate-limit belongs to Sub2API handling"
-			log.Printf("account=%d phase=keep_quota result=ok", acc.ID)
+			log.Printf("account=%d phase=%s_keep_quota result=ok", acc.ID, phase)
+		}
+	case "environment_hold":
+		log.Printf("account=%d phase=%s_environment_hold start", acc.ID, phase)
+		if err := s.store.MarkEnvironmentHold(ctx, acc.ID, finalReason+": "+testReason, s.cfg.Interval*10); err != nil {
+			rec.FinalAction = "kept_unknown"
+			rec.FinalReason = "mark environment hold failed: " + err.Error()
+			log.Printf("account=%d phase=%s_environment_hold result=failed reason=%s", acc.ID, phase, err.Error())
+		} else {
+			rec.FinalAction = "environment_hold"
+			rec.FinalReason = finalReason
+			log.Printf("account=%d phase=%s_environment_hold result=ok", acc.ID, phase)
 		}
 	case "soft_deleted":
-		log.Printf("account=%d phase=soft_delete start", acc.ID)
+		log.Printf("account=%d phase=%s_soft_delete start", acc.ID, phase)
 		if err := s.store.SoftDelete(ctx, acc.ID, "deterministic auth death after revive/test: "+testReason); err != nil {
 			rec.FinalAction = "kept_unknown"
 			rec.FinalReason = "soft delete failed: " + err.Error()
-			log.Printf("account=%d phase=soft_delete result=failed reason=%s", acc.ID, err.Error())
+			log.Printf("account=%d phase=%s_soft_delete result=failed reason=%s", acc.ID, phase, err.Error())
 		} else {
 			rec.FinalAction = "soft_deleted"
-			rec.FinalReason = "deterministic auth death after revive/test"
-			log.Printf("account=%d phase=soft_delete result=ok", acc.ID)
-		}
-	case "needs_relogin":
-		log.Printf("account=%d phase=needs_relogin start", acc.ID)
-		if err := s.store.MarkNeedsRelogin(ctx, acc.ID, "needs manual relogin: "+testReason); err != nil {
-			rec.FinalAction = "kept_unknown"
-			rec.FinalReason = "mark needs relogin failed: " + err.Error()
-			log.Printf("account=%d phase=needs_relogin result=failed reason=%s", acc.ID, err.Error())
-		} else {
-			rec.FinalAction = "needs_relogin"
-			rec.FinalReason = "needs manual relogin: " + testReason
-			log.Printf("account=%d phase=needs_relogin result=ok", acc.ID)
+			rec.FinalReason = finalReason
+			log.Printf("account=%d phase=%s_soft_delete result=ok", acc.ID, phase)
 		}
 	default:
 		rec.FinalAction = "kept_unknown"
 		rec.FinalReason = "test uncertain: " + testReason
 	}
+}
+
+func (s *Service) markSkippedNonAccountIssue(ctx context.Context, id int64, rec *AuditRecord) {
+	if err := s.store.MarkSkippedNonAccountIssue(ctx, id, rec.FinalReason); err != nil {
+		rec.FinalAction = "kept_unknown"
+		rec.FinalReason = "mark skipped non-account issue failed: " + err.Error()
+		log.Printf("account=%d phase=mark_skipped_non_account_issue result=failed reason=%s", id, err.Error())
+	}
+}
+
+func (s *Service) reviveAfterAuthTest(ctx context.Context, acc Account, rec *AuditRecord, authReason string) {
+	refreshToken, _ := acc.Credentials["refresh_token"].(string)
+	if refreshToken == "" {
+		if err := s.store.SoftDelete(ctx, acc.ID, authReason+"; no refresh token available"); err != nil {
+			rec.FinalAction = "kept_unknown"
+			rec.FinalReason = "soft delete failed: " + err.Error()
+		} else {
+			rec.FinalAction = "soft_deleted"
+			rec.FinalReason = authReason + "; no refresh token available"
+		}
+		return
+	}
+	rec.RefreshAttempted = true
+	log.Printf("account=%d phase=env_hold_auth_refresh start", acc.ID)
+	tokens, reason, err := s.refresher.RefreshWithRetries(ctx, refreshToken)
+	rec.RefreshReason = reason
+	if err != nil {
+		rec.RefreshResult = "failed"
+		cls := ClassifyEvidence(reason)
+		if cls == ClassInfrastructure {
+			rec.FinalAction = "environment_hold"
+			rec.FinalReason = "guardian env hold: refresh uncertain: " + reason
+			if err := s.store.MarkEnvironmentHold(ctx, acc.ID, rec.FinalReason, s.cfg.Interval*10); err != nil {
+				rec.FinalAction = "kept_unknown"
+				rec.FinalReason = "mark environment hold failed: " + err.Error()
+				log.Printf("account=%d phase=env_hold_auth_refresh_environment_hold result=failed reason=%s", acc.ID, err.Error())
+			}
+			return
+		}
+		if cls == ClassNeedsRelogin || cls == ClassEligibleAuth {
+			if err := s.store.SoftDelete(ctx, acc.ID, "deterministic auth death after revive/test: "+authReason+"; refresh failed: "+reason); err != nil {
+				rec.FinalAction = "kept_unknown"
+				rec.FinalReason = "soft delete failed: " + err.Error()
+			} else {
+				rec.FinalAction = "soft_deleted"
+				rec.FinalReason = "deterministic auth death after revive/test"
+			}
+			return
+		}
+		rec.FinalAction = "kept_unknown"
+		rec.FinalReason = "refresh uncertain: " + reason
+		s.markSkippedNonAccountIssue(ctx, acc.ID, rec)
+		return
+	}
+	rec.RefreshResult = "ok"
+	log.Printf("account=%d phase=env_hold_auth_refresh result=ok", acc.ID)
+	if err := s.store.PatchCredentials(ctx, acc.ID, tokens); err != nil {
+		rec.FinalAction = "kept_unknown"
+		rec.FinalReason = "credential patch failed: " + err.Error()
+		return
+	}
+	log.Printf("account=%d phase=env_hold_auth_retest start model=%s", acc.ID, s.cfg.TestModel)
+	testResult, testReason := s.sub2api.TestAccountWithRetries(ctx, acc.ID)
+	rec.TestResult = testResult
+	rec.TestReason = testReason
+	log.Printf("account=%d phase=env_hold_auth_retest result=%s reason=%s", acc.ID, testResult, testReason)
+	finalAction, finalReason := resolveTestFinalAction(testResult, testReason)
+	s.applyTestFinalAction(ctx, acc, rec, finalAction, finalReason, testReason, "env_hold_auth_retest")
+	if rec.FinalAction == "revived" {
+		rec.FinalReason = "refreshed after environment hold and live check succeeded"
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return "environment/network failure"
 }
 
 func resolveTestFinalAction(result TestResult, reason string) (string, string) {
@@ -313,10 +446,16 @@ func resolveTestFinalAction(result TestResult, reason string) (string, string) {
 	case TestDead:
 		return "soft_deleted", "deterministic auth death after revive/test"
 	case TestNeedsRelogin:
-		return "needs_relogin", "needs manual relogin: " + reason
+		return "soft_deleted", "needs manual relogin: " + reason
+	case TestInfrastructure:
+		return "environment_hold", "guardian env hold"
 	default:
-		if ClassifyEvidence(reason) == ClassNeedsRelogin {
-			return "needs_relogin", "needs manual relogin: " + reason
+		cls := ClassifyEvidence(reason)
+		if cls == ClassNeedsRelogin {
+			return "soft_deleted", "needs manual relogin: " + reason
+		}
+		if cls == ClassInfrastructure {
+			return "environment_hold", "guardian env hold"
 		}
 		return "kept_unknown", "test uncertain: " + reason
 	}
@@ -494,6 +633,12 @@ func (s *Service) CheckDeletedReviveCandidate(ctx context.Context, acc Account) 
 		rec.FinalReason = "dry-run: would refresh, temporarily restore, test, then restore or re-soft-delete"
 		return rec
 	}
+	startDecision := decideDeletedReviveStart(acc)
+	if !startDecision.RefreshAllowed {
+		rec.FinalAction = startDecision.FinalAction
+		rec.FinalReason = startDecision.FinalReason
+		return rec
+	}
 	refreshToken, _ := acc.Credentials["refresh_token"].(string)
 	if refreshToken == "" {
 		rec.RefreshResult = "missing_refresh_token"
@@ -534,8 +679,9 @@ func (s *Service) CheckDeletedReviveCandidate(ctx context.Context, acc Account) 
 	rec.TestResult = result
 	rec.TestReason = testReason
 	log.Printf("account=%d phase=deleted_revive_test result=%s reason=%s", acc.ID, result, testReason)
-	switch result {
-	case TestOK:
+	decision := decideDeletedReviveTestResult(result, testReason)
+	switch decision.FinalAction {
+	case "restored_deleted":
 		if err := s.store.RestoreSoftDeleted(ctx, acc.ID); err != nil {
 			rec.FinalAction = "kept_unknown"
 			rec.FinalReason = "restore soft-deleted account failed: " + err.Error()
@@ -543,7 +689,7 @@ func (s *Service) CheckDeletedReviveCandidate(ctx context.Context, acc Account) 
 		}
 		rec.FinalAction = "restored_deleted"
 		rec.FinalReason = "soft-deleted account revived and live check succeeded"
-	case TestQuota:
+	case "restored_deleted_quota":
 		if err := s.store.RestoreSoftDeleted(ctx, acc.ID); err != nil {
 			rec.FinalAction = "kept_unknown"
 			rec.FinalReason = "restore quota soft-deleted account failed: " + err.Error()
@@ -551,12 +697,80 @@ func (s *Service) CheckDeletedReviveCandidate(ctx context.Context, acc Account) 
 		}
 		rec.FinalAction = "restored_deleted_quota"
 		rec.FinalReason = "soft-deleted account refreshed but quota/rate-limited; restored for Sub2API handling"
+	case "deleted_kept_environment":
+		if err := s.store.ReSoftDelete(ctx, acc.ID, deletedReviveEnvironmentRetryReason(testReason)); err != nil {
+			rec.FinalAction = "kept_unknown"
+			rec.FinalReason = "re-soft-delete environment retry after deleted revive check failed: " + err.Error()
+			return rec
+		}
+		rec.FinalAction = decision.FinalAction
+		rec.FinalReason = decision.FinalReason
 	default:
-		_ = s.store.ReSoftDelete(ctx, acc.ID, "deleted revive check failed: "+testReason)
+		if err := s.store.ReSoftDelete(ctx, acc.ID, "deleted revive check failed: "+testReason); err != nil {
+			rec.FinalAction = "kept_unknown"
+			rec.FinalReason = "re-soft-delete after deleted revive check failed: " + err.Error()
+			return rec
+		}
 		rec.FinalAction = "deleted_kept"
 		rec.FinalReason = "soft-deleted account still not live: " + testReason
 	}
 	return rec
+}
+
+type DeletedReviveStartDecision struct {
+	RefreshAllowed bool
+	FinalAction    string
+	FinalReason    string
+}
+
+type DeletedReviveTestDecision struct {
+	FinalAction  string
+	FinalReason  string
+	ReSoftDelete bool
+}
+
+func decideDeletedReviveTestResult(result TestResult, reason string) DeletedReviveTestDecision {
+	switch result {
+	case TestOK:
+		return DeletedReviveTestDecision{FinalAction: "restored_deleted", FinalReason: "soft-deleted account revived and restored"}
+	case TestQuota:
+		return DeletedReviveTestDecision{FinalAction: "restored_deleted_quota", FinalReason: "soft-deleted account refreshed but quota/rate-limited; restored for Sub2API handling"}
+	case TestInfrastructure:
+		return DeletedReviveTestDecision{FinalAction: "deleted_kept_environment", FinalReason: "soft-deleted account hit environment/network test failure; kept soft-deleted for retry: " + reason}
+	default:
+		if ClassifyEvidence(reason) == ClassInfrastructure {
+			return DeletedReviveTestDecision{FinalAction: "deleted_kept_environment", FinalReason: "soft-deleted account hit environment/network test failure; kept soft-deleted for retry: " + reason}
+		}
+		return DeletedReviveTestDecision{FinalAction: "deleted_kept", FinalReason: "soft-deleted account still not live: " + reason, ReSoftDelete: true}
+	}
+}
+
+func deletedReviveEnvironmentRetryReason(reason string) string {
+	return "deterministic auth death after revive/test: environment retry pending: " + reason
+}
+
+func decideDeletedReviveStart(acc Account) DeletedReviveStartDecision {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(acc.ErrorMessage)), "deterministic auth death after revive/test:") {
+		return DeletedReviveStartDecision{RefreshAllowed: true}
+	}
+	cls := ClassifyEvidence(acc.ErrorMessage, acc.TempUnschedulableReason)
+	switch cls {
+	case ClassInfrastructure:
+		return DeletedReviveStartDecision{
+			RefreshAllowed: false,
+			FinalAction:    "deleted_kept_environment",
+			FinalReason:    "soft-deleted account has environment/network evidence; refresh skipped: " + firstNonEmpty(acc.ErrorMessage, acc.TempUnschedulableReason),
+		}
+	case ClassQuota, ClassRequestParameter, ClassNotEligible:
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(acc.ErrorMessage)), "deterministic auth death after revive/test:") {
+			return DeletedReviveStartDecision{
+				RefreshAllowed: false,
+				FinalAction:    "deleted_kept",
+				FinalReason:    "soft-deleted account is not deterministic auth death: " + firstNonEmpty(acc.ErrorMessage, acc.TempUnschedulableReason),
+			}
+		}
+	}
+	return DeletedReviveStartDecision{RefreshAllowed: true}
 }
 
 func (s *Service) writeAudit(rec AuditRecord) {

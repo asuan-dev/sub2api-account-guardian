@@ -52,7 +52,7 @@ func (s *Store) EligibleAccounts(ctx context.Context, limit int) ([]Account, err
 		if err != nil {
 			return nil, err
 		}
-		if IsEligibleAccount(acc.Platform, acc.Type, acc.Status, acc.Deleted, acc.ErrorMessage) || IsInactiveSchedulableAccount(acc) {
+		if IsGuardianCandidateAccount(acc, time.Now()) {
 			out = append(out, acc)
 		}
 	}
@@ -64,17 +64,102 @@ func eligibleAccountsQuery() string {
 		SELECT id, name, platform, type, status, schedulable, deleted_at IS NOT NULL AS deleted,
 		       COALESCE(error_message, '') AS error_message,
 		       COALESCE(credentials, '{}'::jsonb) AS credentials,
-		       updated_at
+		       updated_at,
+		       temp_unschedulable_until,
+		       COALESCE(temp_unschedulable_reason, '') AS temp_unschedulable_reason
 		FROM accounts
 		WHERE deleted_at IS NULL
 		  AND platform = 'openai'
 		  AND type = 'oauth'
+		  AND (temp_unschedulable_until IS NULL OR temp_unschedulable_until <= now())
+		  AND NOT (` + quotaOrRequestParameterEvidenceSQL() + `)
+		  AND NOT (schedulable = true AND (` + infrastructureEvidenceSQL() + `))
 		  AND (
-		    (status IN ('error', 'active', 'inactive') AND COALESCE(error_message, '') <> '')
+		    (status IN ('error', 'active', 'inactive') AND (` + accountAuthEvidenceSQL() + `))
+		    OR (status IN ('error', 'active', 'inactive') AND schedulable = false AND (` + infrastructureEvidenceSQL() + `))
 		    OR (status = 'inactive' AND schedulable = true)
+		    OR (status = 'active' AND schedulable = false)
+		    OR (temp_unschedulable_until IS NOT NULL AND temp_unschedulable_until <= now())
+		    OR (COALESCE(temp_unschedulable_reason, '') <> '' AND (temp_unschedulable_until IS NULL OR temp_unschedulable_until <= now()))
+		    OR NOT (COALESCE(credentials, '{}'::jsonb) ? 'access_token')
+		    OR COALESCE(credentials->>'access_token', '') = ''
 		  )
 		ORDER BY updated_at ASC
 		LIMIT $1`
+}
+
+func accountAuthEvidenceSQL() string {
+	return `
+		      lower(COALESCE(error_message, '')) LIKE '%401%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%token_revoked%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%token_expired%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%token_invalidated%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%refresh_token_reused%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%app_session_terminated%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%session has ended%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%no access token available%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%openai account has been deactivated%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%account has been deactivated%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%no access token%'`
+}
+
+func infrastructureEvidenceSQL() string {
+	return `
+		      lower(COALESCE(error_message, '')) LIKE '%cloudflare%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%unexpected eof%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%cf-ray%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%just a moment%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%attention required%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%unsupported_country_region_territory%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%country, region, or territory not supported%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%request_forbidden%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%access forbidden (403)%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%403 temporary cooldown%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%consecutive_403%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%timeout%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%timed out%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%deadline exceeded%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%tls%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%dns%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%lookup%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%eof%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%connection refused%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%connection reset%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%network%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%proxy%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%server misbehaving%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%temporary unavailable%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%status 500%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%status 502%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%status 503%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%status 504%'
+		      OR lower(COALESCE(error_message, '')) LIKE '% 500%'
+		      OR lower(COALESCE(error_message, '')) LIKE '% 502%'
+		      OR lower(COALESCE(error_message, '')) LIKE '% 503%'
+		      OR lower(COALESCE(error_message, '')) LIKE '% 504%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%upstream request failed%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%no terminal sse%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%http 500%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%http 502%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%http 503%'
+		      OR lower(COALESCE(error_message, '')) LIKE '%http 504%'`
+}
+
+func quotaOrRequestParameterEvidenceSQL() string {
+	return `
+		    lower(COALESCE(error_message, '') || ' ' || COALESCE(temp_unschedulable_reason, '')) LIKE '%429%'
+		    OR lower(COALESCE(error_message, '') || ' ' || COALESCE(temp_unschedulable_reason, '')) LIKE '%rate_limit%'
+		    OR lower(COALESCE(error_message, '') || ' ' || COALESCE(temp_unschedulable_reason, '')) LIKE '%rate limit%'
+		    OR lower(COALESCE(error_message, '') || ' ' || COALESCE(temp_unschedulable_reason, '')) LIKE '%usage limit%'
+		    OR lower(COALESCE(error_message, '') || ' ' || COALESCE(temp_unschedulable_reason, '')) LIKE '%too many request%'
+		    OR lower(COALESCE(error_message, '') || ' ' || COALESCE(temp_unschedulable_reason, '')) LIKE '%quota%'
+		    OR lower(COALESCE(error_message, '') || ' ' || COALESCE(temp_unschedulable_reason, '')) LIKE '%invalid request%'
+		    OR lower(COALESCE(error_message, '') || ' ' || COALESCE(temp_unschedulable_reason, '')) LIKE '%unsupported parameter%'
+		    OR lower(COALESCE(error_message, '') || ' ' || COALESCE(temp_unschedulable_reason, '')) LIKE '%unknown parameter%'
+		    OR lower(COALESCE(error_message, '') || ' ' || COALESCE(temp_unschedulable_reason, '')) LIKE '%unsupported model%'
+		    OR lower(COALESCE(error_message, '') || ' ' || COALESCE(temp_unschedulable_reason, '')) LIKE '%missing model%'
+		    OR lower(COALESCE(error_message, '') || ' ' || COALESCE(temp_unschedulable_reason, '')) LIKE '%model not found%'
+		    OR lower(COALESCE(error_message, '') || ' ' || COALESCE(temp_unschedulable_reason, '')) LIKE '%disable_response_storage%'`
 }
 
 func (s *Store) AccountSummary(ctx context.Context) (map[string]int64, error) {
@@ -116,7 +201,9 @@ func (s *Store) RecentAccounts(ctx context.Context, limit int) ([]Account, error
 		SELECT id, name, platform, type, status, schedulable, deleted_at IS NOT NULL AS deleted,
 		       COALESCE(error_message, '') AS error_message,
 		       COALESCE(credentials, '{}'::jsonb) AS credentials,
-		       updated_at
+		       updated_at,
+		       temp_unschedulable_until,
+		       COALESCE(temp_unschedulable_reason, '') AS temp_unschedulable_reason
 		FROM accounts
 		WHERE platform='openai' AND type='oauth'
 		  AND (deleted_at IS NULL OR updated_at > now() - interval '24 hours')
@@ -165,7 +252,9 @@ func deletedReviveCandidatesQuery(limitClause string) string {
 		SELECT id, name, platform, type, status, schedulable, deleted_at IS NOT NULL AS deleted,
 		       COALESCE(error_message, '') AS error_message,
 		       COALESCE(credentials, '{}'::jsonb) AS credentials,
-		       updated_at
+		       updated_at,
+		       temp_unschedulable_until,
+		       COALESCE(temp_unschedulable_reason, '') AS temp_unschedulable_reason
 		FROM accounts
 		WHERE deleted_at IS NOT NULL
 		  AND platform = 'openai'
@@ -244,15 +333,11 @@ func (s *Store) DisableScheduling(ctx context.Context, id int64, reason string) 
 	})
 }
 
-func (s *Store) MarkNeedsRelogin(ctx context.Context, id int64, reason string) error {
+func (s *Store) MarkSkippedNonAccountIssue(ctx context.Context, id int64, reason string) error {
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `
 			UPDATE accounts
-			SET status='active',
-			    schedulable=false,
-			    error_message=$2,
-			    temp_unschedulable_until=NULL,
-			    temp_unschedulable_reason='guardian: needs manual relogin',
+			SET temp_unschedulable_reason=$2,
 			    updated_at=now()
 			WHERE id=$1 AND deleted_at IS NULL`, id, reason); err != nil {
 			return err
@@ -261,12 +346,40 @@ func (s *Store) MarkNeedsRelogin(ctx context.Context, id int64, reason string) e
 	})
 }
 
+func (s *Store) MarkEnvironmentHold(ctx context.Context, id int64, reason string, retryAfter time.Duration) error {
+	if retryAfter <= 0 {
+		retryAfter = time.Minute
+	}
+	retryAfterSeconds := int64(retryAfter.Seconds())
+	if retryAfterSeconds < 1 {
+		retryAfterSeconds = 1
+	}
+	return s.withTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, markEnvironmentHoldSQL(), id, reason, retryAfterSeconds); err != nil {
+			return err
+		}
+		return s.enqueueChangedTx(ctx, tx, id)
+	})
+}
+
+func markEnvironmentHoldSQL() string {
+	return `
+			UPDATE accounts
+			SET schedulable=false,
+			    temp_unschedulable_until=now() + ($3 * interval '1 second'),
+			    temp_unschedulable_reason=$2,
+			    updated_at=now()
+			WHERE id=$1 AND deleted_at IS NULL`
+}
+
 func (s *Store) GetAccount(ctx context.Context, id int64) (Account, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT id, name, platform, type, status, schedulable, deleted_at IS NOT NULL AS deleted,
 		       COALESCE(error_message, '') AS error_message,
 		       COALESCE(credentials, '{}'::jsonb) AS credentials,
-		       updated_at
+		       updated_at,
+		       temp_unschedulable_until,
+		       COALESCE(temp_unschedulable_reason, '') AS temp_unschedulable_reason
 		FROM accounts
 		WHERE id=$1`, id)
 	return scanAccount(row)
@@ -275,7 +388,7 @@ func (s *Store) GetAccount(ctx context.Context, id int64) (Account, error) {
 func scanAccount(row pgx.Row) (Account, error) {
 	var acc Account
 	var credBytes []byte
-	err := row.Scan(&acc.ID, &acc.Name, &acc.Platform, &acc.Type, &acc.Status, &acc.Schedulable, &acc.Deleted, &acc.ErrorMessage, &credBytes, &acc.UpdatedAt)
+	err := row.Scan(&acc.ID, &acc.Name, &acc.Platform, &acc.Type, &acc.Status, &acc.Schedulable, &acc.Deleted, &acc.ErrorMessage, &credBytes, &acc.UpdatedAt, &acc.TempUnschedulableUntil, &acc.TempUnschedulableReason)
 	if err != nil {
 		return acc, err
 	}
@@ -342,10 +455,7 @@ func (s *Store) MarkLive(ctx context.Context, id int64) error {
 
 func (s *Store) KeepQuota(ctx context.Context, id int64) error {
 	return s.withTx(ctx, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `
-			UPDATE accounts
-			SET status='active', error_message='', schedulable=true, updated_at=now()
-			WHERE id=$1 AND deleted_at IS NULL`, id); err != nil {
+		if _, err := tx.Exec(ctx, keepQuotaSQL(), id); err != nil {
 			return err
 		}
 		if err := s.ensureGroupTx(ctx, tx, id); err != nil {
@@ -353,6 +463,27 @@ func (s *Store) KeepQuota(ctx context.Context, id int64) error {
 		}
 		return s.enqueueChangedTx(ctx, tx, id)
 	})
+}
+
+func keepQuotaSQL() string {
+	return `
+			UPDATE accounts
+			SET status='active',
+			    error_message='',
+			    schedulable=CASE
+			      WHEN COALESCE(temp_unschedulable_reason, '') LIKE 'guardian%' THEN true
+			      ELSE schedulable
+			    END,
+			    temp_unschedulable_until=CASE
+			      WHEN COALESCE(temp_unschedulable_reason, '') LIKE 'guardian%' THEN NULL
+			      ELSE temp_unschedulable_until
+			    END,
+			    temp_unschedulable_reason=CASE
+			      WHEN COALESCE(temp_unschedulable_reason, '') LIKE 'guardian%' THEN NULL
+			      ELSE temp_unschedulable_reason
+			    END,
+			    updated_at=now()
+			WHERE id=$1 AND deleted_at IS NULL`
 }
 
 func (s *Store) SoftDelete(ctx context.Context, id int64, reason string) error {

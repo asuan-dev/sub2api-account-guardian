@@ -1,6 +1,9 @@
 package guardian
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 type EvidenceClass string
 
@@ -16,11 +19,12 @@ const (
 type TestResult string
 
 const (
-	TestOK           TestResult = "ok"
-	TestDead         TestResult = "dead"
-	TestQuota        TestResult = "quota"
-	TestNeedsRelogin TestResult = "needs_relogin"
-	TestUnknown      TestResult = "unknown"
+	TestOK             TestResult = "ok"
+	TestDead           TestResult = "dead"
+	TestQuota          TestResult = "quota"
+	TestNeedsRelogin   TestResult = "needs_relogin"
+	TestInfrastructure TestResult = "infrastructure"
+	TestUnknown        TestResult = "unknown"
 )
 
 var quotaMarkers = []string{
@@ -85,6 +89,16 @@ var infrastructureMarkers = []string{
 	"http 502",
 	"http 503",
 	"http 504",
+	"unsupported_country_region_territory",
+	"country, region, or territory not supported",
+	"request_forbidden",
+	"access forbidden (403)",
+	"403 temporary cooldown",
+	"consecutive_403",
+	"cloudflare",
+	"cf-ray",
+	"just a moment",
+	"attention required",
 }
 
 var authMarkers = []string{
@@ -103,6 +117,7 @@ var authMarkers = []string{
 	"refresh token expired",
 	"token_expired",
 	"unauthorized (401)",
+	"no access token available",
 }
 
 func ClassifyEvidence(values ...string) EvidenceClass {
@@ -144,24 +159,125 @@ func ClassifyTestError(errText string) TestResult {
 		return TestQuota
 	case ClassNeedsRelogin:
 		return TestNeedsRelogin
-	case ClassInfrastructure, ClassRequestParameter, ClassNotEligible:
+	case ClassInfrastructure:
+		return TestInfrastructure
+	case ClassRequestParameter, ClassNotEligible:
 		return TestUnknown
 	default:
 		return TestUnknown
 	}
 }
 
-func IsEligibleAccount(platform, accountType, status string, deleted bool, errorText string) bool {
-	return isEligibleBaseAccount(platform, accountType, status, deleted, errorText) && ClassifyEvidence(errorText) == ClassEligibleAuth
-}
-
 func IsRefreshableMissingAccessTokenAccount(acc Account) bool {
 	if !isEligibleBaseAccount(acc.Platform, acc.Type, acc.Status, acc.Deleted, acc.ErrorMessage) {
 		return false
 	}
+	return HasMissingAccessToken(acc)
+}
+
+func HasMissingAccessToken(acc Account) bool {
 	accessToken, _ := acc.Credentials["access_token"].(string)
 	refreshToken, _ := acc.Credentials["refresh_token"].(string)
 	return strings.TrimSpace(accessToken) == "" && strings.TrimSpace(refreshToken) != ""
+}
+
+func HasNoAccessToken(acc Account) bool {
+	accessToken, _ := acc.Credentials["access_token"].(string)
+	return strings.TrimSpace(accessToken) == ""
+}
+
+func IsGuardianCandidateAccount(acc Account, now time.Time) bool {
+	if acc.Deleted {
+		return false
+	}
+	if strings.ToLower(strings.TrimSpace(acc.Platform)) != "openai" {
+		return false
+	}
+	if strings.ToLower(strings.TrimSpace(acc.Type)) != "oauth" {
+		return false
+	}
+	if strings.TrimSpace(acc.TempUnschedulableReason) == "confirmed live by 8001 live check" {
+		return true
+	}
+	if IsGuardianProcessingStale(acc) {
+		return true
+	}
+	if IsDisabledWithoutEvidence(acc) {
+		return true
+	}
+	if IsEnvironmentHoldCandidate(acc, now) {
+		return true
+	}
+	if IsFutureEnvironmentHold(acc, now) {
+		return false
+	}
+	cls := ClassifyEvidence(acc.ErrorMessage, acc.TempUnschedulableReason)
+	switch cls {
+	case ClassInfrastructure:
+		return !acc.Schedulable
+	case ClassQuota, ClassRequestParameter:
+		return false
+	case ClassEligibleAuth, ClassNeedsRelogin:
+		return true
+	}
+	if IsInactiveSchedulableAccount(acc) || HasNoAccessToken(acc) {
+		return true
+	}
+	return false
+}
+
+func IsEnvironmentHoldCandidate(acc Account, now time.Time) bool {
+	if acc.Deleted {
+		return false
+	}
+	if strings.ToLower(strings.TrimSpace(acc.Platform)) != "openai" {
+		return false
+	}
+	if strings.ToLower(strings.TrimSpace(acc.Type)) != "oauth" {
+		return false
+	}
+	reason := strings.ToLower(strings.TrimSpace(acc.TempUnschedulableReason))
+	isEnvHold := strings.HasPrefix(reason, "guardian env hold:") ||
+		(acc.TempUnschedulableUntil != nil && ClassifyEvidence(acc.ErrorMessage, acc.TempUnschedulableReason) == ClassInfrastructure)
+	if !isEnvHold {
+		return false
+	}
+	if acc.TempUnschedulableUntil == nil {
+		return true
+	}
+	return !acc.TempUnschedulableUntil.After(now)
+}
+
+func IsFutureEnvironmentHold(acc Account, now time.Time) bool {
+	if acc.TempUnschedulableUntil == nil {
+		return false
+	}
+	if !acc.TempUnschedulableUntil.After(now) {
+		return false
+	}
+	reason := strings.ToLower(strings.TrimSpace(acc.TempUnschedulableReason))
+	return strings.HasPrefix(reason, "guardian env hold:") ||
+		ClassifyEvidence(acc.ErrorMessage, acc.TempUnschedulableReason) == ClassInfrastructure
+}
+
+func IsGuardianProcessingStale(acc Account) bool {
+	reason := strings.ToLower(strings.TrimSpace(acc.TempUnschedulableReason))
+	return !acc.Deleted &&
+		strings.ToLower(strings.TrimSpace(acc.Platform)) == "openai" &&
+		strings.ToLower(strings.TrimSpace(acc.Type)) == "oauth" &&
+		!acc.Schedulable &&
+		(strings.Contains(reason, "guardian processing") ||
+			strings.Contains(reason, "guardian: testing soft-deleted revive"))
+}
+
+func IsDisabledWithoutEvidence(acc Account) bool {
+	return !acc.Deleted &&
+		strings.ToLower(strings.TrimSpace(acc.Platform)) == "openai" &&
+		strings.ToLower(strings.TrimSpace(acc.Type)) == "oauth" &&
+		strings.ToLower(strings.TrimSpace(acc.Status)) == "active" &&
+		!acc.Schedulable &&
+		strings.TrimSpace(acc.ErrorMessage) == "" &&
+		strings.TrimSpace(acc.TempUnschedulableReason) == ""
 }
 
 func IsInactiveSchedulableAccount(acc Account) bool {
